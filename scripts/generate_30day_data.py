@@ -29,7 +29,9 @@ import heapq
 import json
 import math
 import os
+import pathlib
 import random
+import subprocess
 import sys
 import time
 from typing import Dict, List, Tuple, Any, Optional
@@ -362,6 +364,7 @@ def generate_symbol_session_ticks(
     cal_date: str,      # YYYY-MM-DD
     day_bars: List[Dict[str, float]],
     seed: int = 42,
+    provider_mode: str = "default",
 ) -> List[Tuple[int, str]]:
     """
     Generates chronological Level-2 ticks for a single symbol on a single trading day.
@@ -663,6 +666,28 @@ def generate_symbol_session_ticks(
         )
         session_ticks.append((ts_ns, line))
 
+        # In AngelOne Binary WebSocket Mode 3, L2 depth updates arrive sub-second even when
+        # no trade executes (delta_vol == 0, cum_volume unchanged) while last_qty (ltq) stays sticky.
+        if provider_mode == "angelone" and not (is_watchdog_pause_day and 37790 <= sec <= 37815):
+            for sub_i in range(1, 4):
+                sub_ts_ns = ts_ns + sub_i * 250_000_000 + rng.randint(1_000, 25_000)
+                if not in_breakout and not is_chop_day and rng.random() < 0.22:
+                    # Ephemeral sub-second L2 depth flicker / quote-stuffing burst with zero volume change
+                    if rng.random() < 0.55:
+                        f_bid_q = rng.randint(3600, 5400)
+                        f_ask_q = rng.randint(120, 260)
+                    else:
+                        f_bid_q = rng.randint(120, 260)
+                        f_ask_q = rng.randint(3600, 5400)
+                else:
+                    f_bid_q = max(50, bid_q + rng.randint(-180, 180))
+                    f_ask_q = max(50, ask_q + rng.randint(-180, 180))
+                ws_line = (
+                    f"{sub_ts_ns},{token},{symbol},{current_price:.2f},{qty},{cum_volume},"
+                    f"{bid0_p:.2f},{f_bid_q},{ask0_p:.2f},{f_ask_q},{upper_c:.2f},{lower_c:.2f}"
+                )
+                session_ticks.append((sub_ts_ns, ws_line))
+
         # Advance time by 6 seconds (interleaved gap across 5 symbols = 1.2s <= 3.0s)
         step = 6
         if in_breakout or in_circuit_test or in_be_test:
@@ -710,10 +735,12 @@ def generate_30day_dataset(
     output_csv: str = "data/historical_30days_nse.csv",
     cache_dir: str = "data/cache_1m",
     force_offline: bool = False,
+    provider_mode: str = "default",
 ) -> None:
     """Generates the full 30-day multi-symbol historical L2 tick dataset."""
+    mode_label = provider_mode.upper() if provider_mode != "default" else "DEFAULT (UPSTOX SNAPSHOT CADENCE)"
     print("=" * 65)
-    print(" DeltaUno 30-Day Multi-Symbol Market Data Pipeline")
+    print(f" DeltaUno 30-Day Multi-Symbol Market Data Pipeline [{mode_label}]")
     print(f" Target Output: {output_csv}")
     print(f" Cache Directory: {cache_dir}")
     print(f" Calendar Range: {TARGET_DATES[0]} to {TARGET_DATES[-1]} (30 Trading Sessions)")
@@ -747,7 +774,9 @@ def generate_30day_dataset(
             # Generate ticks for all 5 symbols for this day
             for sym in SYMBOL_LIST:
                 bars = all_symbol_bars[sym][day_idx - 1]
-                ticks = generate_symbol_session_ticks(sym, day_idx, cal_date, bars)
+                ticks = generate_symbol_session_ticks(
+                    sym, day_idx, cal_date, bars, provider_mode=provider_mode
+                )
                 day_generators.append(ticks)
 
             # Include embedded external alerts for this day
@@ -1238,16 +1267,140 @@ def validate_dataset(csv_path: str) -> bool:
     return True
 
 
+def run_engine_benchmark(csv_path: str, label: str) -> Dict[str, Any]:
+    """Runs deltauno C++20 engine in --mode both against csv_path and parses Track A/B/C metrics."""
+    repo_root = pathlib.Path(__file__).resolve().parent.parent
+    candidates = [
+        repo_root / "build" / "deltauno.exe",
+        repo_root / "build" / "Release" / "deltauno.exe",
+        repo_root / "build" / "deltauno",
+    ]
+    engine_bin = next((c for c in candidates if c.exists()), None)
+    if engine_bin is None:
+        raise FileNotFoundError("Compiled deltauno binary not found in build/.")
+
+    cmd = [
+        str(engine_bin),
+        "--mode", "both",
+        "--emit-events",
+        "--csv", str(pathlib.Path(csv_path).resolve()),
+        "--capital", "10000.00",
+        "--harv-capital", "10000.00",
+        "--omni-capital", "10000.00",
+    ]
+    proc = subprocess.run(
+        cmd,
+        cwd=repo_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    tracks = {
+        "COMPOUNDER": {"equity": 10000.0, "pnl": 0.0, "trades": 0, "wins": 0, "losses": 0, "longs": 0, "shorts": 0},
+        "HARVESTER":  {"equity": 10000.0, "pnl": 0.0, "trades": 0, "wins": 0, "losses": 0, "longs": 0, "shorts": 0},
+        "OMNI":       {"equity": 10000.0, "pnl": 0.0, "trades": 0, "wins": 0, "losses": 0, "longs": 0, "shorts": 0},
+    }
+    ticks_processed = 0
+    try:
+        with open(csv_path, "r", encoding="utf-8") as cf:
+            for ln in cf:
+                if ln and not ln.startswith("#"):
+                    ticks_processed += 1
+    except Exception:
+        pass
+    for raw_line in proc.stdout.splitlines():
+        line = raw_line.strip()
+        if line.startswith("[LIVE_EVENT] "):
+            try:
+                ev = json.loads(line[len("[LIVE_EVENT] "):])
+            except Exception:
+                continue
+            if ev.get("type") == "FILL":
+                tk = ev.get("track", "COMPOUNDER")
+                side = ev.get("side", "")
+                if tk in tracks and side in ("SELL", "COVER"):
+                    net_pnl = float(ev.get("net_pnl", 0.0))
+                    tracks[tk]["pnl"] += net_pnl
+                    tracks[tk]["equity"] = float(ev.get("balance", 10000.0 + tracks[tk]["pnl"]))
+                    tracks[tk]["trades"] += 1
+                    if net_pnl > 0:
+                        tracks[tk]["wins"] += 1
+                    else:
+                        tracks[tk]["losses"] += 1
+                    if side == "COVER":
+                        tracks[tk]["shorts"] += 1
+                    else:
+                        tracks[tk]["longs"] += 1
+        elif "Total Ticks Processed" in line or "Ticks Processed" in line:
+            try:
+                ticks_processed = int(line.split(":")[1].strip().replace(",", ""))
+            except Exception:
+                pass
+    return {"label": label, "csv": csv_path, "ticks": ticks_processed, "tracks": tracks}
+
+
+def print_provider_comparison(results: List[Dict[str, Any]]) -> None:
+    """Prints side-by-side 30-day performance table for Upstox vs AngelOne modes."""
+    print("\n" + "=" * 108)
+    print(" DELTAUNO 30-DAY PROVIDER MODE BENCHMARK: UPSTOX (1.2s TRADE-ALIGNED) vs ANGELONE (SUB-SECOND WS MODE 3)")
+    print("=" * 108)
+    print(
+        f"{'Mode':<22} | {'Ticks':>10} | {'Track A (Compounder)':>22} | "
+        f"{'Track B (Harvester)':>22} | {'Track C (Bi-Dir Omni)':>22}"
+    )
+    print("-" * 108)
+    for r in results:
+        c = r["tracks"]["COMPOUNDER"]
+        h = r["tracks"]["HARVESTER"]
+        o = r["tracks"]["OMNI"]
+        c_wr = (c["wins"] / c["trades"] * 100.0) if c["trades"] else 0.0
+        h_wr = (h["wins"] / h["trades"] * 100.0) if h["trades"] else 0.0
+        o_wr = (o["wins"] / o["trades"] * 100.0) if o["trades"] else 0.0
+        c_str = f"{c['pnl']:+8.2f} ({c['trades']:2d}T/{c_wr:4.0f}%)"
+        h_str = f"{h['pnl']:+8.2f} ({h['trades']:2d}T/{h_wr:4.0f}%)"
+        o_str = f"{o['pnl']:+8.2f} ({o['trades']:2d}T/{o_wr:4.0f}%)"
+        print(f"{r['label']:<22} | {r['ticks']:>10,} | {c_str:>22} | {h_str:>22} | {o_str:>22}")
+    print("=" * 108 + "\n")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="DeltaUno 30-Day Market Data Generator")
     parser.add_argument("--out", default="data/historical_30days_nse.csv", help="Output CSV path")
     parser.add_argument("--cache-dir", default="data/cache_1m", help="Raw bar cache directory")
     parser.add_argument("--offline", action="store_true", help="Force offline calibrated synthetic generation")
     parser.add_argument("--validate", action="store_true", default=True, help="Validate dataset invariants")
+    parser.add_argument(
+        "--provider-mode",
+        default="default",
+        choices=["default", "upstox", "angelone", "both"],
+        help="Tick generation profile: 'default'/'upstox' (trade-aligned L2 snapshots), 'angelone' (sub-second WS Mode 3 with delta_vol=0 flickers), or 'both' (run and compare both)",
+    )
     args = parser.parse_args()
 
-    generate_30day_dataset(args.out, args.cache_dir, args.offline)
-
-    if args.validate:
-        if not validate_dataset(args.out):
-            sys.exit(1)
+    if args.provider_mode == "default":
+        generate_30day_dataset(args.out, args.cache_dir, args.offline, provider_mode="default")
+        if args.validate:
+            if not validate_dataset(args.out):
+                sys.exit(1)
+    elif args.provider_mode == "both":
+        upstox_csv = "data/live_30days_upstox.csv"
+        angel_csv = "data/live_30days_angelone.csv"
+        generate_30day_dataset(upstox_csv, args.cache_dir, args.offline, provider_mode="upstox")
+        generate_30day_dataset(angel_csv, args.cache_dir, args.offline, provider_mode="angelone")
+        res_up = run_engine_benchmark(upstox_csv, "UPSTOX (30-Day)")
+        res_ao = run_engine_benchmark(angel_csv, "ANGELONE WS (30-Day)")
+        print_provider_comparison([res_up, res_ao])
+    else:
+        out_path = args.out
+        if out_path == "data/historical_30days_nse.csv" and args.provider_mode == "angelone":
+            out_path = "data/live_30days_angelone.csv"
+        elif out_path == "data/historical_30days_nse.csv" and args.provider_mode == "upstox":
+            out_path = "data/live_30days_upstox.csv"
+        generate_30day_dataset(out_path, args.cache_dir, args.offline, provider_mode=args.provider_mode)
+        if args.provider_mode == "upstox" and args.validate:
+            if not validate_dataset(out_path):
+                sys.exit(1)
+        res = run_engine_benchmark(out_path, f"{args.provider_mode.upper()} (30-Day)")
+        print_provider_comparison([res])

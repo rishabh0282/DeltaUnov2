@@ -32,6 +32,14 @@ on:
           - zerodha
           - upstox
           - yahoo
+      universe:
+        description: "Active Symbol Universe (core5 = 5 calibrated equities, all10 = includes high-beta additions)"
+        required: false
+        default: "core5"
+        type: choice
+        options:
+          - core5
+          - all10
       start_now:
         description: "Start streaming immediately without waiting for 09:15 IST?"
         required: false
@@ -98,6 +106,7 @@ jobs:
         run: |
           MODE="${{ github.event.inputs.mode || 'both' }}"
           PROVIDER="${{ github.event.inputs.provider || 'auto' }}"
+          UNIVERSE="${{ github.event.inputs.universe || 'core5' }}"
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             MAX_MIN="${{ github.event.inputs.max_runtime_minutes || '355' }}"
             if [ "${{ github.event.inputs.start_now }}" = "true" ]; then
@@ -113,6 +122,7 @@ jobs:
           python3 scripts/run_live_paper_trading.py \
             --mode "$MODE" \
             --provider "$PROVIDER" \
+            --universe "$UNIVERSE" \
             --max-runtime-minutes "$MAX_MIN" \
             $START_FLAG | tee live_session_output.log
 

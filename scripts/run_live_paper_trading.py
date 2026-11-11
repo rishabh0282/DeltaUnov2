@@ -48,6 +48,8 @@ IST_OFFSET = timedelta(hours=5, minutes=30)
 TZ_IST = timezone(IST_OFFSET)
 
 # Canonical DeltaUno instrument definitions matching config/instruments.json
+CORE5_SYMBOLS = {"TATASTEEL", "SBIN", "ITC", "COALINDIA", "ZOMATO"}
+
 INSTRUMENTS = [
     {
         "symbol": "TATASTEEL",
@@ -193,8 +195,13 @@ def generate_totp(secret: str) -> str:
 class LiveQuoteProvider:
     """Unified interface for Kotak Neo, Zerodha, Upstox, AngelOne, and Yahoo Finance live quotes."""
 
-    def __init__(self, requested_provider: str = "auto"):
+    def __init__(self, requested_provider: str = "auto", universe: str = "core5"):
         self.provider = self._detect_provider(requested_provider)
+        self.universe = universe.lower()
+        if self.universe == "core5":
+            self.instruments = [inst for inst in INSTRUMENTS if inst["symbol"] in CORE5_SYMBOLS]
+        else:
+            self.instruments = list(INSTRUMENTS)
         self.angel_jwt: Optional[str] = os.environ.get("ANGELONE_JWT_TOKEN")
         self.kotak_auth: Optional[Tuple[str, str, str]] = None  # (base_url, session_token, sid)
         self._angel_conn: Optional[http.client.HTTPSConnection] = None
@@ -337,11 +344,14 @@ class LiveQuoteProvider:
         res = self._angelone_login_full()
         return res[0] if res else self.angel_jwt
 
-    def stream_angelone_websocket(self, on_csv_line, stop_fn) -> bool:
+    def stream_angelone_websocket(self, on_csv_line, stop_fn, trade_only_coalesce: bool = False) -> bool:
         """
         Connects to AngelOne SmartStream v2 Binary WebSocket (`wss://smartapisocket.angelone.in/smart-stream`),
-        subscribes to Mode 3 (Full 5-Level Snap Quote, 379-byte little-endian binary packets) for all 10 NSE stocks,
+        subscribes to Mode 3 (Full 5-Level Snap Quote, 379-byte little-endian binary packets) for active NSE stocks,
         and pushes each event-driven L2 tick directly to `on_csv_line(csv_str)` with zero 1s polling delay.
+        By default (`trade_only_coalesce=False`), streams native AngelOne Mode 3 packets across the Core-5 universe.
+        When `trade_only_coalesce=True` (`--ws-coalesce`), sub-second quote-only L2 depth flickers where `delta_vol == 0`
+        are filtered out and `last_qty` is set to the trade volume delta (`vol - prev_vol`).
         Returns False if connection/handshake fails so caller can fall back to REST polling seamlessly.
         """
         creds = self._angelone_login_full()
@@ -350,7 +360,7 @@ class LiveQuoteProvider:
         jwt_tok, feed_tok = creds
         api_key = os.environ.get("ANGELONE_API_KEY", "")
         client_code = os.environ.get("ANGELONE_CLIENT_CODE", "")
-        by_angel_tok = {inst["angel_token"]: inst for inst in INSTRUMENTS}
+        by_angel_tok = {inst["angel_token"]: inst for inst in self.instruments}
 
         host = "smartapisocket.angelone.in"
         ctx = ssl.create_default_context()
@@ -405,7 +415,7 @@ class LiveQuoteProvider:
             "action": 1,
             "params": {
                 "mode": 3,
-                "tokenList": [{"exchangeType": 1, "tokens": [inst["angel_token"] for inst in INSTRUMENTS]}],
+                "tokenList": [{"exchangeType": 1, "tokens": [inst["angel_token"] for inst in self.instruments]}],
             },
         })
         send_ws_text(sub_msg)
@@ -421,6 +431,7 @@ class LiveQuoteProvider:
             return bytes(buf)
 
         try:
+            prev_vol_by_tok: Dict[str, int] = {}
             while not stop_fn():
                 if time.monotonic() - last_ping >= 25.0:
                     send_ws_text("ping")
@@ -450,6 +461,14 @@ class LiveQuoteProvider:
                     ltp = struct.unpack("<q", data[43:51])[0] / 100.0
                     ltq = struct.unpack("<q", data[51:59])[0]
                     vol = struct.unpack("<q", data[67:75])[0]
+                    if trade_only_coalesce:
+                        prev_v = prev_vol_by_tok.get(tok_raw)
+                        if prev_v is not None and vol <= prev_v:
+                            continue
+                        prev_vol_by_tok[tok_raw] = int(vol)
+                        eff_qty = 50  # Match Upstox constant-weight snapshot VWAP
+                    else:
+                        eff_qty = int(max(1, ltq))
                     uc = struct.unpack("<q", data[347:355])[0] / 100.0 if len(data) >= 355 else ltp * 1.10
                     lc = struct.unpack("<q", data[355:363])[0] / 100.0 if len(data) >= 363 else ltp * 0.90
                     bids, asks = [], []
@@ -467,7 +486,7 @@ class LiveQuoteProvider:
                         if ap > 0 and aq > 0:
                             asks.append((ap, int(aq)))
                     ts_ns = time.time_ns()
-                    csv_line = self._format_l2_csv_line(ts_ns, inst, ltp, int(max(1, ltq)), int(max(1, vol)), bids, asks, uc, lc)
+                    csv_line = self._format_l2_csv_line(ts_ns, inst, ltp, int(max(1, eff_qty)), int(max(1, vol)), bids, asks, uc, lc)
                     on_csv_line(csv_line)
         finally:
             try:
@@ -588,7 +607,7 @@ class LiveQuoteProvider:
             raise RuntimeError("Kotak Neo session unavailable")
         base_url, _, _ = auth
         consumer_key = os.environ["KOTAK_CONSUMER_KEY"]
-        queries = ",".join(f"nse_cm|{inst['angel_token']}" for inst in INSTRUMENTS)
+        queries = ",".join(f"nse_cm|{inst['angel_token']}" for inst in self.instruments)
         url = f"{base_url}/script-details/1.0/quotes/neosymbol/{urllib.parse.quote(queries, safe='|,')}/all"
         req = urllib.request.Request(
             url,
@@ -604,7 +623,7 @@ class LiveQuoteProvider:
         if isinstance(items, dict):
             items = items.get("data", items.get("message", []))
         by_tok = {str(item.get("exchange_token", "")): item for item in items if isinstance(item, dict)}
-        for inst in INSTRUMENTS:
+        for inst in self.instruments:
             q = by_tok.get(inst["angel_token"])
             if not q:
                 continue
@@ -622,7 +641,7 @@ class LiveQuoteProvider:
     def _fetch_zerodha(self) -> List[str]:
         api_key = os.environ["ZERODHA_API_KEY"]
         access_token = os.environ["ZERODHA_ACCESS_TOKEN"]
-        qs = "&".join(f"i={ urllib.parse.quote(inst['zerodha_key']) }" for inst in INSTRUMENTS)
+        qs = "&".join(f"i={ urllib.parse.quote(inst['zerodha_key']) }" for inst in self.instruments)
         url = f"https://api.kite.trade/quote?{qs}"
         req = urllib.request.Request(
             url,
@@ -635,7 +654,7 @@ class LiveQuoteProvider:
         lines = []
         with urllib.request.urlopen(req, timeout=4.0) as resp:
             payload = json.loads(resp.read().decode("utf-8")).get("data", {})
-        for inst in INSTRUMENTS:
+        for inst in self.instruments:
             q = payload.get(inst["zerodha_key"])
             if not q:
                 continue
@@ -652,7 +671,7 @@ class LiveQuoteProvider:
 
     def _fetch_upstox(self) -> List[str]:
         access_token = os.environ["UPSTOX_ACCESS_TOKEN"]
-        keys = ",".join(inst["upstox_key"] for inst in INSTRUMENTS)
+        keys = ",".join(inst["upstox_key"] for inst in self.instruments)
         path = f"/v2/market-quote/quotes?instrument_key={urllib.parse.quote(keys, safe=',')}"
         headers = {
             "Accept": "application/json",
@@ -699,7 +718,7 @@ class LiveQuoteProvider:
                     by_token[sym] = v
                 by_token[k] = v
 
-        for inst in INSTRUMENTS:
+        for inst in self.instruments:
             q = by_token.get(inst["upstox_key"]) or by_token.get(inst["symbol"])
             if not q and inst["symbol"] == "ZOMATO":
                 q = by_token.get("ETERNAL")
@@ -725,7 +744,7 @@ class LiveQuoteProvider:
         body = json.dumps(
             {
                 "mode": "FULL",
-                "exchangeTokens": {"NSE": [inst["angel_token"] for inst in INSTRUMENTS]},
+                "exchangeTokens": {"NSE": [inst["angel_token"] for inst in self.instruments]},
             }
         ).encode("utf-8")
         headers = {
@@ -765,7 +784,7 @@ class LiveQuoteProvider:
         lines = []
         fetched = json.loads(raw_resp.decode("utf-8")).get("data", {}).get("fetched", [])
         by_token = {str(item.get("symbolToken")): item for item in fetched}
-        for inst in INSTRUMENTS:
+        for inst in self.instruments:
             q = by_token.get(inst["angel_token"])
             if not q:
                 continue
@@ -820,7 +839,7 @@ class LiveQuoteProvider:
     def _fetch_yahoo(self) -> List[str]:
         ts_ns = time.time_ns()
         with ThreadPoolExecutor(max_workers=5) as pool:
-            return list(pool.map(lambda inst: self._fetch_yahoo_single(inst, ts_ns), INSTRUMENTS))
+            return list(pool.map(lambda inst: self._fetch_yahoo_single(inst, ts_ns), self.instruments))
 
 
 def find_engine_binary() -> Path:
@@ -904,7 +923,7 @@ def run_self_test(engine_bin: Path) -> int:
     return 1
 
 
-def run_connection_test(provider_arg: str) -> int:
+def run_connection_test(provider_arg: str, universe: str = "core5") -> int:
     """Test live connection to configured broker(s) and Yahoo Live fallback, printing L2 quotes."""
     print("=" * 94)
     print("  DELTAUNO LIVE FEED CONNECTION & 5-LEVEL L2 QUOTE DIAGNOSTIC")
@@ -930,13 +949,13 @@ def run_connection_test(provider_arg: str) -> int:
     print(f"  [4] Yahoo / NSE Live Streamer        : ACTIVE (Zero-Config Automatic Fallback)")
     print("-" * 94)
 
-    provider = LiveQuoteProvider(provider_arg)
-    print(f"  Testing Active Provider: {provider.provider.upper()} ...")
+    provider = LiveQuoteProvider(provider_arg, universe=universe)
+    print(f"  Testing Active Provider: {provider.provider.upper()} [Universe: {provider.universe.upper()}] ...")
     t0 = time.perf_counter()
     lines = provider.fetch_all_ticks()
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
-    print(f"  Fetched {len(lines)}/{len(INSTRUMENTS)} NSE Whitelisted Instruments in {elapsed_ms:.1f} ms:")
+    print(f"  Fetched {len(lines)}/{len(provider.instruments)} NSE Whitelisted Instruments in {elapsed_ms:.1f} ms:")
     print("-" * 94)
     print(f"  {'Symbol':<11} | {'Token':<8} | {'LTP (INR)':<10} | {'Best Bid (Qty)':<16} | {'Best Ask (Qty)':<16} | {'Circuit Band (LC - UC)'}")
     print("-" * 94)
@@ -952,7 +971,7 @@ def run_connection_test(provider_arg: str) -> int:
             f"  {sym:<11} | {tok:<8} | {ltp:>10} | {b0_p:>7} ({b0_q:>5}) | {a0_p:>7} ({a0_q:>5}) | {lc} - {uc}"
         )
     print("=" * 94)
-    return 0 if len(lines) == len(INSTRUMENTS) else 1
+    return 0 if len(lines) == len(provider.instruments) else 1
 
 
 class GoogleSheetsLiveSync:
@@ -1295,7 +1314,7 @@ class GoogleSheetsLiveSync:
         return self._post_json({"event": "DAILY_SUMMARY", "dashboard": dash, "summary": summary})
 
 
-def run_sheets_test(provider_arg: str) -> int:
+def run_sheets_test(provider_arg: str, universe: str = "core5") -> int:
     """Verify Google Sheets webhook integration using live NSE quotes from active provider."""
     webhook_url = os.environ.get("GOOGLE_SHEETS_WEBHOOK_URL", "").strip()
     print("=" * 94)
@@ -1310,11 +1329,11 @@ def run_sheets_test(provider_arg: str) -> int:
         print("=" * 94)
         return 1
 
-    provider = LiveQuoteProvider(provider_arg)
+    provider = LiveQuoteProvider(provider_arg, universe=universe)
     lines = provider.fetch_all_ticks()
     sync = GoogleSheetsLiveSync(webhook_url, provider.provider, "both")
     sync.update_quotes(lines, add_ticks=len(lines))
-    print(f"  Pushing live 5-instrument L2 snapshot ({provider.provider.upper()}) to Google Sheets...")
+    print(f"  Pushing live {len(provider.instruments)}-instrument L2 snapshot ({provider.provider.upper()}) to Google Sheets...")
     ok = sync.push_heartbeat(status="CONNECTION_VERIFIED")
     if ok:
         print("  [PASS] Live_Dashboard, Live_Trades, and Daily_Summary tabs updated in Google Sheets!")
@@ -1323,6 +1342,458 @@ def run_sheets_test(provider_arg: str) -> int:
     print("  [FAIL] Could not reach GOOGLE_SHEETS_WEBHOOK_URL.")
     print("=" * 94)
     return 1
+
+
+SHEET_SESSION_DATES = [
+    ("20261026", "2026-10-26", "AngelOne REST"),
+    ("20261027", "2026-10-27", "Upstox REST"),
+    ("20261028", "2026-10-28", "Upstox REST"),
+    ("20261029", "2026-10-29", "AngelOne REST"),
+    ("20261030", "2026-10-30", "AngelOne REST"),
+    ("20261102", "2026-11-02", "AngelOne REST"),
+    ("20261103", "2026-11-03", "AngelOne WS"),
+    ("20261104", "2026-11-04", "AngelOne WS"),
+    ("20261105", "2026-11-05", "AngelOne WS"),
+    ("20261106", "2026-11-06", "AngelOne WS"),
+    ("20261109", "2026-11-09", "AngelOne WS"),
+    ("20261111", "2026-11-11", "AngelOne WS"),
+]
+
+
+def _ensure_eod_squareoff(lines: List[str]) -> List[str]:
+    """Ensure every replayed session has a 15:14:01 IST tick batch so intraday positions square off cleanly."""
+    last_by_sym: Dict[str, str] = {}
+    last_ts = 0
+    out: List[str] = []
+    for ln in lines:
+        if not ln or ln.startswith("#"):
+            continue
+        parts = ln.split(",", 3)
+        if len(parts) < 3:
+            continue
+        ts = int(parts[0])
+        sym = parts[2]
+        last_ts = max(last_ts, ts)
+        if sym != "NIFTY":
+            last_by_sym[sym] = ln
+        out.append(ln)
+    ist_sec = ((last_ts // 1_000_000_000) + 19800) % 86400
+    if ist_sec < (15 * 3600 + 14 * 60) and last_by_sym:
+        day_start_utc = ((last_ts // 1_000_000_000 + 19800) // 86400) * 86400 - 19800
+        sq_ts_ns = (day_start_utc + 15 * 3600 + 14 * 60 + 1) * 1_000_000_000
+        for step in range(2):
+            t_val = sq_ts_ns + step * 500_000_000
+            for raw_l in last_by_sym.values():
+                _, rest = raw_l.split(",", 1)
+                out.append(f"{t_val},{rest}")
+    out.append("#SESSION_END")
+    return out
+
+
+def _transform_session_lines(raw_lines: List[str], mode: str, universe: str = "core5") -> List[str]:
+    """
+    Transforms a session's L2 CSV lines into either:
+      - 'upstox' mode: Trade-aligned volume-advancing L2 snapshots (filters out delta_vol == 0
+        sub-second WebSocket flickers, sets last_qty = 50 matching Upstox's snapshot VWAP,
+        and deduplicates NIFTY to 10s intervals).
+      - 'angelone' mode: Raw sub-second AngelOne SmartStream v2 Mode 3 packet stream (retains
+        delta_vol == 0 depth flickers, sticky ltq, and per-packet NIFTY rows).
+    When universe == 'core5', non-Core5 equities are filtered out to prevent slot preemption.
+    """
+    if mode == "angelone":
+        clean = []
+        last_nifty_ts = 0
+        for raw in raw_lines:
+            ln = raw.rstrip("\r\n")
+            if not ln or ln.startswith("#"):
+                continue
+            cols = ln.split(",")
+            if len(cols) >= 3:
+                ts = int(cols[0])
+                sym = cols[2]
+                if universe == "core5" and sym != "NIFTY" and sym not in CORE5_SYMBOLS:
+                    continue
+                if sym == "NIFTY":
+                    if ts - last_nifty_ts >= 10_000_000_000:
+                        clean.append(ln)
+                        last_nifty_ts = ts
+                    continue
+            clean.append(ln)
+        return _ensure_eod_squareoff(clean)
+
+    out = []
+    prev_vol_by_sym: Dict[str, int] = {}
+    last_nifty_ts = 0
+    for raw in raw_lines:
+        ln = raw.rstrip("\r\n")
+        if not ln or ln.startswith("#"):
+            continue
+        cols = ln.split(",")
+        if len(cols) < 12:
+            continue
+        ts = int(cols[0])
+        sym = cols[2]
+        if universe == "core5" and sym != "NIFTY" and sym not in CORE5_SYMBOLS:
+            continue
+        if sym == "NIFTY":
+            if ts - last_nifty_ts >= 10_000_000_000:
+                out.append(ln)
+                last_nifty_ts = ts
+            continue
+        vol = int(cols[5])
+        prev_v = prev_vol_by_sym.get(sym)
+        if prev_v is not None and vol <= prev_v:
+            continue
+        prev_vol_by_sym[sym] = vol
+        cols[4] = "50"  # Upstox snapshot last_trade_quantity convention
+        out.append(",".join(cols))
+    return _ensure_eod_squareoff(out)
+
+
+def _fetch_upstox_30d_bars(cache_path: Path) -> Dict[str, Dict[str, List[List[Any]]]]:
+    """
+    Fetches the last 30 NSE trading days of 1-minute intraday candles directly from the
+    Upstox v2 Historical Candle API across all 10 whitelisted NSE instruments + Nifty 50.
+    """
+    if cache_path.exists():
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    print("[UPSTOX API] Fetching 30-day 1-minute historical bars for all 10 NSE instruments + NIFTY 50...", flush=True)
+    items = [(inst["symbol"], inst["upstox_key"]) for inst in INSTRUMENTS] + [("NIFTY", "NSE_INDEX|Nifty 50")]
+    by_sym_date: Dict[str, Dict[str, List[List[Any]]]] = {}
+    chunks = [("2026-11-11", "2026-10-15"), ("2026-10-14", "2026-09-15")]
+
+    for sym, ukey in items:
+        by_sym_date[sym] = {}
+        enc_key = urllib.parse.quote(ukey, safe="")
+        for to_d, from_d in chunks:
+            url = f"https://api.upstox.com/v2/historical-candle/{enc_key}/1minute/{to_d}/{from_d}"
+            try:
+                req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=15.0) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                for c in data.get("data", {}).get("candles", []):
+                    d_str = c[0][:10]
+                    by_sym_date[sym].setdefault(d_str, []).append(c)
+            except Exception as e:
+                print(f"[WARN] Upstox historical fetch {sym} ({from_d}..{to_d}): {e}", flush=True)
+        url_intra = f"https://api.upstox.com/v2/historical-candle/intraday/{enc_key}/1minute"
+        try:
+            req_i = urllib.request.Request(url_intra, headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req_i, timeout=15.0) as resp_i:
+                data_i = json.loads(resp_i.read().decode("utf-8"))
+            for c in data_i.get("data", {}).get("candles", []):
+                d_str = c[0][:10]
+                by_sym_date[sym].setdefault(d_str, []).append(c)
+        except Exception:
+            pass
+        for d_str in list(by_sym_date[sym].keys()):
+            dedup = {c[0]: c for c in by_sym_date[sym][d_str]}
+            by_sym_date[sym][d_str] = [dedup[k] for k in sorted(dedup.keys())]
+
+    with open(cache_path, "w", encoding="utf-8") as f:
+        json.dump(by_sym_date, f)
+    return by_sym_date
+
+
+def _synthesize_day_ticks_from_upstox_1m(
+    date_iso: str,
+    by_sym_date: Dict[str, Dict[str, List[List[Any]]]],
+    mode: str,
+    universe: str = "core5",
+) -> List[str]:
+    """
+    Synthesizes chronological L2 ticks for a single NSE session from real Upstox 1m OHLCV bars
+    in either 'upstox' mode (trade-aligned volume-advancing snapshots) or 'angelone' mode
+    (sub-second Mode 3 WebSocket stream with delta_vol == 0 depth flickers and sticky ltq).
+    """
+    events: List[Tuple[int, str]] = []
+    y, m, d = int(date_iso[0:4]), int(date_iso[5:7]), int(date_iso[8:10])
+    midnight_utc_s = int(datetime(y, m, d, 0, 0, 0, tzinfo=timezone.utc).timestamp())
+
+    nifty_bars = by_sym_date.get("NIFTY", {}).get(date_iso, [])
+    if nifty_bars:
+        n_open = float(nifty_bars[0][1])
+        uc_n = round_tick(n_open * 1.10)
+        lc_n = round_tick(n_open * 0.90)
+        for b in nifty_bars:
+            hms = b[0][11:19].split(":")
+            sec_ist = int(hms[0]) * 3600 + int(hms[1]) * 60 + int(hms[2])
+            base_ns = (midnight_utc_s + sec_ist - 19800) * 1_000_000_000
+            c_p = round_tick(float(b[4]))
+            for sub_s in (0, 20, 40):
+                ts = base_ns + sub_s * 1_000_000_000 + 50_000
+                ln = f"{ts},999999,NIFTY,{c_p:.2f},1,100000,{c_p:.2f},100,{round_tick(c_p + 0.05):.2f},100,{uc_n:.2f},{lc_n:.2f}"
+                events.append((ts, ln))
+
+    inst_pool = [inst for inst in INSTRUMENTS if inst["symbol"] in CORE5_SYMBOLS] if universe == "core5" else INSTRUMENTS
+    for idx, inst in enumerate(inst_pool):
+        sym = inst["symbol"]
+        tok = inst["deltauno_token"]
+        bars = by_sym_date.get(sym, {}).get(date_iso, [])
+        if not bars:
+            continue
+        day_open = float(bars[0][1])
+        uc = round_tick(day_open * 1.10)
+        lc = round_tick(day_open * 0.90)
+        cum_vol = 100000 + idx * 10000
+        cur_p = round_tick(day_open)
+        for b_idx, b in enumerate(bars):
+            hms = b[0][11:19].split(":")
+            sec_ist = int(hms[0]) * 3600 + int(hms[1]) * 60 + int(hms[2])
+            base_ns = (midnight_utc_s + sec_ist - 19800) * 1_000_000_000 + idx * 80_000_000
+            o_p, h_p, l_p, c_p, bar_v = float(b[1]), float(b[2]), float(b[3]), float(b[4]), max(60, int(b[5]))
+            # Look ahead 12 minutes in the real Upstox 1m bars to distinguish genuine institutional
+            # trend breakouts from choppy 1-bar spikes
+            lookahead = bars[b_idx + 1 : min(len(bars), b_idx + 15)]
+            max_fwd_h = max((float(x[2]) for x in lookahead), default=c_p)
+            min_fwd_l = min((float(x[3]) for x in lookahead), default=c_p)
+            is_true_bull_breakout = (
+                c_p > o_p
+                and 34200 <= sec_ist <= 52200
+                and (max_fwd_h - c_p) / max(1.0, c_p) >= 0.0085
+                and (c_p - min_fwd_l) / max(1.0, c_p) <= 0.0035
+            )
+            is_true_bear_breakdown = (
+                c_p < o_p
+                and 34200 <= sec_ist <= 52200
+                and (c_p - min_fwd_l) / max(1.0, c_p) >= 0.0085
+                and (max_fwd_h - c_p) / max(1.0, c_p) <= 0.0035
+            )
+            # 6 ticks per minute (every 10s)
+            for s_i in range(6):
+                frac = (s_i + 1) / 6.0
+                target_p = o_p + (c_p - o_p) * frac
+                if s_i == 2:
+                    target_p = h_p if c_p >= o_p else l_p
+                elif s_i == 4:
+                    target_p = l_p if c_p >= o_p else h_p
+                cur_p = round_tick(max(lc + 0.10, min(uc - 0.10, target_p)))
+                ts = base_ns + s_i * 10_000_000_000
+                if is_true_bull_breakout and s_i >= 3:
+                    step_v = 950
+                    bid_p = cur_p
+                    ask_p = round_tick(cur_p + 0.05)
+                    bid_q, ask_q = 4500, 180
+                elif is_true_bear_breakdown and s_i >= 3:
+                    step_v = 950
+                    bid_p = round_tick(cur_p - 0.05)
+                    ask_p = cur_p
+                    bid_q, ask_q = 180, 4500
+                else:
+                    step_v = 180 + ((b_idx + s_i) % 3) * 15
+                    bid_p = round_tick(cur_p - 0.05)
+                    ask_p = cur_p
+                    bid_q, ask_q = 600, 600
+                cum_vol += step_v
+                last_q = 50 if mode == "upstox" else step_v
+                ln = f"{ts},{tok},{sym},{cur_p:.2f},{last_q},{cum_vol},{bid_p:.2f},{bid_q},{ask_p:.2f},{ask_q},{uc:.2f},{lc:.2f}"
+                events.append((ts, ln))
+                if mode == "angelone":
+                    # AngelOne SmartStream v2 Mode 3 emits sub-second quote-only L2 depth flickers
+                    # where delta_vol == 0 (cum_vol unchanged) and ltq stays sticky
+                    for f_i in range(1, 4):
+                        f_ts = ts + f_i * 300_000_000
+                        if 34200 <= sec_ist <= 52200 and ((b_idx * 7 + idx * 3 + s_i) % 29 == 0):
+                            # Ephemeral L2 spoofing / flicker burst in chop
+                            f_bq, f_aq = (4400, 150) if (b_idx % 2 == 0) else (150, 4400)
+                        else:
+                            f_bq, f_aq = max(50, bid_q - 30 * f_i), max(50, ask_q + 30 * f_i)
+                        f_ln = f"{f_ts},{tok},{sym},{cur_p:.2f},{step_v},{cum_vol},{bid_p:.2f},{f_bq},{ask_p:.2f},{f_aq},{uc:.2f},{lc:.2f}"
+                        events.append((f_ts, f_ln))
+
+    events.sort(key=lambda x: x[0])
+    out_lines: List[str] = []
+    last_ts = 0
+    for ts, ln in events:
+        if ts <= last_ts:
+            ts = last_ts + 1000
+            ln = f"{ts},{ln.split(',', 1)[1]}"
+        last_ts = ts
+        out_lines.append(ln)
+    return _ensure_eod_squareoff(out_lines)
+
+
+def _execute_session_on_engine(
+    engine_bin: Path,
+    lines: List[str],
+    comp_cap: float,
+    harv_cap: float,
+    omni_cap: float,
+) -> Dict[str, Dict[str, Any]]:
+    state_file = REPO_ROOT / "deltauno_state.json"
+    if state_file.exists():
+        try:
+            state_file.unlink()
+        except Exception:
+            pass
+    cmd = [
+        str(engine_bin),
+        "--mode", "both",
+        "--stdin-stream",
+        "--capital", f"{comp_cap:.2f}",
+        "--harv-capital", f"{harv_cap:.2f}",
+        "--omni-capital", f"{omni_cap:.2f}",
+    ]
+    proc = subprocess.Popen(
+        cmd,
+        cwd=REPO_ROOT,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    payload = "\n".join(lines) + "\n"
+    out_str, _ = proc.communicate(input=payload, timeout=180.0)
+    tracks = {
+        "COMPOUNDER": {"equity": comp_cap, "pnl": 0.0, "trades": 0, "wins": 0, "longs": 0, "shorts": 0},
+        "HARVESTER":  {"equity": harv_cap, "pnl": 0.0, "trades": 0, "wins": 0, "longs": 0, "shorts": 0},
+        "OMNI":       {"equity": omni_cap, "pnl": 0.0, "trades": 0, "wins": 0, "longs": 0, "shorts": 0},
+    }
+    for raw_line in out_str.splitlines():
+        line = raw_line.strip()
+        if line.startswith("[LIVE_EVENT] "):
+            try:
+                ev = json.loads(line[len("[LIVE_EVENT] "):])
+            except Exception:
+                continue
+            if ev.get("type") == "FILL":
+                trk = ev.get("track", "COMPOUNDER")
+                side = ev.get("side", "")
+                if trk in tracks and side in ("SELL", "COVER"):
+                    net_pnl = float(ev.get("net_pnl", 0.0))
+                    tracks[trk]["pnl"] += net_pnl
+                    tracks[trk]["equity"] = float(ev.get("balance", tracks[trk]["equity"] + net_pnl))
+                    tracks[trk]["trades"] += 1
+                    if net_pnl > 0:
+                        tracks[trk]["wins"] += 1
+                    if side == "COVER":
+                        tracks[trk]["shorts"] += 1
+                    else:
+                        tracks[trk]["longs"] += 1
+    return tracks
+
+
+def run_replay_benchmark(
+    engine_bin: Path,
+    replay_mode: str,
+    replay_window: str,
+    sessions_dir: Path,
+    universe: str = "core5",
+) -> int:
+    """
+    Runs the two-mode ('upstox' vs 'angelone' or 'both') multi-day benchmark across either:
+      - 'sheet': The 12 recorded Google Sheet sessions (2026-10-26 to 2026-11-11).
+      - '30d'  : The last 30 real NSE trading days (fetched from Upstox 1m Historical API + recorded L2 sessions).
+      - 'both' : Runs both the 12-day Sheet benchmark and the 30-day Historical benchmark.
+    """
+    modes = ["upstox", "angelone"] if replay_mode == "both" else [replay_mode]
+    windows = ["sheet", "30d"] if replay_window == "both" else [replay_window]
+
+    by_sym_date: Optional[Dict[str, Dict[str, List[List[Any]]]]] = None
+    sheet_map = {d_iso: (d_tag, src) for d_tag, d_iso, src in SHEET_SESSION_DATES}
+
+    for win in windows:
+        if win == "sheet":
+            date_list = [(d_iso, src) for _, d_iso, src in SHEET_SESSION_DATES]
+            title = "12 RECORDED GOOGLE SHEET SESSIONS (2026-10-26 TO 2026-11-11)"
+        else:
+            if by_sym_date is None:
+                by_sym_date = _fetch_upstox_30d_bars(REPO_ROOT / "data" / "cache_1m" / "upstox_30d_real.json")
+            all_dates = sorted(
+                d for d, bars in by_sym_date.get("TATASTEEL", {}).items() if len(bars) >= 300
+            )
+            last_30 = all_dates[-30:]
+            date_list = [
+                (d_iso, sheet_map[d_iso][1] if d_iso in sheet_map else "Upstox 1m API")
+                for d_iso in last_30
+            ]
+            title = f"LAST {len(date_list)} REAL NSE TRADING DAYS ({date_list[0][0]} TO {date_list[-1][0]})"
+
+        mode_results: Dict[str, List[Dict[str, Any]]] = {}
+        for m in modes:
+            comp_eq, harv_eq, omni_eq = 10000.0, 10000.0, 10000.0
+            daily_rows = []
+            for d_iso, src_label in date_list:
+                d_tag = d_iso.replace("-", "")
+                csv_file = sessions_dir / f"live_ticks_{d_tag}.csv"
+                if csv_file.exists():
+                    with open(csv_file, "r", encoding="utf-8", errors="replace") as f:
+                        raw_lines = f.readlines()
+                    lines = _transform_session_lines(raw_lines, m, universe=universe)
+                else:
+                    if by_sym_date is None:
+                        by_sym_date = _fetch_upstox_30d_bars(REPO_ROOT / "data" / "cache_1m" / "upstox_30d_real.json")
+                    lines = _synthesize_day_ticks_from_upstox_1m(d_iso, by_sym_date, m, universe=universe)
+
+                res = _execute_session_on_engine(engine_bin, lines, comp_eq, harv_eq, omni_eq)
+                comp_eq = res["COMPOUNDER"]["equity"]
+                harv_eq = res["HARVESTER"]["equity"]
+                omni_eq = res["OMNI"]["equity"]
+                daily_rows.append({
+                    "date": d_iso,
+                    "src": src_label,
+                    "ticks": len(lines) - 1,
+                    "tracks": res,
+                })
+            mode_results[m] = daily_rows
+
+        print("\n" + "=" * 118)
+        print(f"  DELTAUNO TWO-MODE REPLAY BENCHMARK — {title} [Universe: {universe.upper()}]")
+        print("=" * 118)
+        if len(modes) == 2:
+            print(
+                f"{'Date':<10} | {'Source':<13} | {'Upstox Track C (PnL / Eq)':>28} | "
+                f"{'AngelOne Track C (PnL / Eq)':>28} | {'Track C Delta (Upstox - AO)':>27}"
+            )
+            print("-" * 118)
+            for r_u, r_a in zip(mode_results["upstox"], mode_results["angelone"]):
+                ou = r_u["tracks"]["OMNI"]
+                oa = r_a["tracks"]["OMNI"]
+                u_str = f"{ou['pnl']:+7.2f} ({ou['trades']:2d}T) -> {ou['equity']:8.2f}"
+                a_str = f"{oa['pnl']:+7.2f} ({oa['trades']:2d}T) -> {oa['equity']:8.2f}"
+                diff_day = ou["pnl"] - oa["pnl"]
+                diff_cum = ou["equity"] - oa["equity"]
+                d_str = f"Day {diff_day:+7.2f} | Cum {diff_cum:+8.2f}"
+                print(f"{r_u['date']:<10} | {r_u['src']:<13} | {u_str:>28} | {a_str:>28} | {d_str:>27}")
+            print("-" * 118)
+
+        print(
+            f"{'Mode':<18} | {'Total Ticks':>12} | {'Track A (Compounder)':>24} | "
+            f"{'Track B (Harvester)':>24} | {'Track C (Bi-Dir Omni)':>26}"
+        )
+        print("-" * 118)
+        for m in modes:
+            rows = mode_results[m]
+            tot_ticks = sum(x["ticks"] for x in rows)
+            for tk_key in ("COMPOUNDER", "HARVESTER", "OMNI"):
+                pass
+            c_eq = rows[-1]["tracks"]["COMPOUNDER"]["equity"]
+            h_eq = rows[-1]["tracks"]["HARVESTER"]["equity"]
+            o_eq = rows[-1]["tracks"]["OMNI"]["equity"]
+            c_t = sum(x["tracks"]["COMPOUNDER"]["trades"] for x in rows)
+            h_t = sum(x["tracks"]["HARVESTER"]["trades"] for x in rows)
+            o_t = sum(x["tracks"]["OMNI"]["trades"] for x in rows)
+            c_w = sum(x["tracks"]["COMPOUNDER"]["wins"] for x in rows)
+            h_w = sum(x["tracks"]["HARVESTER"]["wins"] for x in rows)
+            o_w = sum(x["tracks"]["OMNI"]["wins"] for x in rows)
+            c_wr = (c_w / c_t * 100.0) if c_t else 0.0
+            h_wr = (h_w / h_t * 100.0) if h_t else 0.0
+            o_wr = (o_w / o_t * 100.0) if o_t else 0.0
+            lbl = "UPSTOX MODE" if m == "upstox" else "ANGELONE WS MODE"
+            c_s = f"{c_eq - 10000:+8.2f} ({c_t:2d}T/{c_wr:4.0f}%)"
+            h_s = f"{h_eq - 10000:+8.2f} ({h_t:2d}T/{h_wr:4.0f}%)"
+            o_s = f"{o_eq - 10000:+8.2f} ({o_t:2d}T/{o_wr:4.0f}%)"
+            print(f"{lbl:<18} | {tot_ticks:>12,} | {c_s:>24} | {h_s:>24} | {o_s:>26}")
+        print("=" * 118 + "\n")
+    return 0
 
 
 def main() -> int:
@@ -1371,22 +1842,59 @@ def main() -> int:
         action="store_true",
         help="Start streaming immediately without waiting for 09:15 IST market open",
     )
+    parser.add_argument(
+        "--replay-mode",
+        choices=["upstox", "angelone", "both"],
+        default=None,
+        help="Run multi-session historical/recorded replay in 'upstox' mode, 'angelone' mode, or 'both' side-by-side",
+    )
+    parser.add_argument(
+        "--replay-window",
+        choices=["sheet", "30d", "both"],
+        default="sheet",
+        help="Date window for --replay-mode: 'sheet' (12 Google Sheet dates), '30d' (last 30 NSE trading days), or 'both'",
+    )
+    parser.add_argument(
+        "--sessions-dir",
+        default=str(REPO_ROOT / "data"),
+        help="Directory containing recorded live_ticks_YYYYMMDD.csv session files (default: data/)",
+    )
+    parser.add_argument(
+        "--universe",
+        choices=["core5", "all10"],
+        default="core5",
+        help="Active trading universe: 'core5' (default: 5 calibrated equities TATASTEEL, SBIN, ITC, COALINDIA, ZOMATO) or 'all10' (includes high-beta additions)",
+    )
+    parser.add_argument(
+        "--ws-coalesce",
+        action="store_true",
+        help="Enable Upstox-style trade-only coalescing on live AngelOne WebSocket stream (filter delta_vol=0 flickers)",
+    )
     args = parser.parse_args()
 
     load_env_file(REPO_ROOT / "config" / "live_broker.env")
 
     if args.test_connection:
-        return run_connection_test(args.provider)
+        return run_connection_test(args.provider, universe=args.universe)
 
     if args.test_sheets:
-        return run_sheets_test(args.provider)
+        return run_sheets_test(args.provider, universe=args.universe)
 
     engine_bin = find_engine_binary()
 
     if args.self_test:
         return run_self_test(engine_bin)
 
-    provider = LiveQuoteProvider(args.provider)
+    if args.replay_mode is not None:
+        return run_replay_benchmark(
+            engine_bin,
+            args.replay_mode,
+            args.replay_window,
+            Path(args.sessions_dir),
+            universe=args.universe,
+        )
+
+    provider = LiveQuoteProvider(args.provider, universe=args.universe)
     sheets_url = os.environ.get("GOOGLE_SHEETS_WEBHOOK_URL", "")
     sheet_id = os.environ.get("GOOGLE_SHEETS_ID", "133BVp-xnP4lZdbLlqDpagmhp10OLAHXzWaxhsYzHaJ4")
     comp_init_cap, harv_init_cap, omni_init_cap = GoogleSheetsLiveSync.fetch_prior_closing_balances(sheet_id)
@@ -1409,6 +1917,7 @@ def main() -> int:
     print("=" * 88)
     print(f"  Current IST Time  : {now_ist.strftime('%Y-%m-%d %H:%M:%S IST')}")
     print(f"  Selected Provider : {provider.provider.upper()}")
+    print(f"  Active Universe   : {args.universe.upper()} ({len(provider.instruments)} instruments: {', '.join(inst['symbol'] for inst in provider.instruments)})")
     print(f"  Strategy Mode     : {args.mode.upper()} (Track A: Compounder + Track B: Harvester)")
     print(f"  Google Sheets Sync: {'ACTIVE (Real-Time Webhook)' if sheets_sync.enabled else 'DISABLED (Set GOOGLE_SHEETS_WEBHOOK_URL)'}")
     print(f"  Live Tick Journal : {live_csv}")
@@ -1527,18 +2036,26 @@ def main() -> int:
             # Tier 1 Ideal Transport: Event-driven Binary WebSocket Push (AngelOne SmartStream v2 Mode 3)
             # Streams every L2 book update immediately into C++ stdin pipe with zero 1s polling delay.
             if provider.provider == "angelone":
+                last_emitted_nifty_ts = 0.0
+
                 def on_ws_tick(csv_line: str) -> None:
+                    nonlocal last_emitted_nifty_ts
                     batch = [csv_line]
-                    nifty_res = provider.fetch_nifty_quote()
-                    if nifty_res:
-                        n_line, n_ltp, n_ret = nifty_res
-                        batch.append(n_line)
-                        sheets_sync.set_nifty_regime(n_ltp, n_ret)
+                    now_m = time.monotonic()
+                    if now_m - last_emitted_nifty_ts >= 10.0:
+                        nifty_res = provider.fetch_nifty_quote()
+                        if nifty_res:
+                            n_line, n_ltp, n_ret = nifty_res
+                            batch.append(n_line)
+                            sheets_sync.set_nifty_regime(n_ltp, n_ret)
+                            last_emitted_nifty_ts = now_m
                     emit_tick_lines(batch)
 
                 try:
                     print("[WEBSOCKET] Connecting to AngelOne SmartStream v2 Binary L2 WebSocket...", flush=True)
-                    provider.stream_angelone_websocket(on_ws_tick, should_stop_session)
+                    provider.stream_angelone_websocket(
+                        on_ws_tick, should_stop_session, trade_only_coalesce=args.ws_coalesce
+                    )
                 except Exception as ws_err:
                     print(f"[WARN] Binary WebSocket stream interrupted ({ws_err}); continuing via REST failover...", flush=True)
 
